@@ -5,7 +5,9 @@
 ## 业务场景
 知行职教有城东、城西、滨江、高新 4 个教学点。原流程由教学点导出成绩表，分析员复制进工作簿计算，再将截图发给负责人。三类痛点是：排除缺考时容易丢失口径、方案与结果脱节、签核结论没有当时的样本证据。上游是教学点期末成绩；本应用替代手工核对与计算；下游由教研负责人决定是否扩大辅导试点。
 
-四个业务模块：**成绩样本**支持筛选、录入和修订；**辅导分组**登记研究范围和排除规则；**检验工作台**提交后台任务并查看失败原因与历史结果；**教研结论**起草解释、负责人签核并下载包括原始样本快照的 JSON 报告。业务数据均在 PostgreSQL 中持久化，统计由 Python worker 计算。
+四个业务模块：**成绩样本**支持筛选、录入和修订；**辅导分组**登记研究范围和排除规则；**检验工作台**提交后台任务并查看排队、处理中、中断恢复次数与失败原因及历史结果；**教研结论**起草解释、负责人签核并下载包括受理时点方案与样本快照的 JSON 报告。业务数据均在 PostgreSQL 中持久化，统计由 Python worker 计算。
+
+报告在**受理时点**即固化方案快照与全量样本快照（纳入、排除及原因、SHA-256 校验码），worker 只按该批快照复算，后续成绩或方案修订不影响任何已有报告。后台任务通过行锁 `SKIP LOCKED` 领取并以 `run_token` 围栏令牌写入：多进程并发只有当前处理者能落盘，失去资格的旧处理者晚到结果匹配 0 行、无法覆盖；worker 每 8 秒续租心跳，心跳超时 30 秒的 running 任务自动回收为 queued 并累计恢复次数，重试沿用同一报告行，不新增报告、不重复写结果。
 
 ## 启动
 ```sh
@@ -30,17 +32,24 @@ JWT 有效期 8 小时；角色由服务器读取数据库，不信任客户端�
 3. 09:10 录入 `ZX-2026-161`，学员161，城东，小组辅导组，82.5 分。
 4. 09:20 将缺考学员标记为缺考并清空成绩，避免把零分当缺失。
 5. 09:30 新建 `2026秋季 · 城东晚间辅导` 方案，选城东并排除缺考。
-6. 09:40 提交后台检验；界面自动更新排队、完成或失败状态。
-7. 10:00 查看两组均分、95% 区间、p 值、Cohen d 和排除数，起草后续随机试验建议。
+6. 09:40 提交后台检验；界面自动更新排队、处理中（含当前处理者）、恢复次数、完成或失败状态。
+7. 10:00 查看两组均分、95% 区间、p 值、Cohen d 和排除数，以及受理时点的方案与样本快照，起草后续随机试验建议。
 8. 10:10 负责人签核结论；分析员不能修改已签核报告。
-9. 10:20 观察员下载 `tutor-effect-report-<id>.json`，复核当时样本快照和 SHA-256。
+9. 10:20 观察员下载 `tutor-effect-report-<id>.json`，内含当时方案、纳入与排除样本（含排除原因）、统计量、复算指引和 SHA-256，可脱离系统独立复算。
 
 ## 算法与口径
 输入是方案教学点内两组 0–100 分成绩。空成绩永远排除；开启排除缺考时再排除 absent=true 的成绩。显示总选中数和排除数。有效样本每组至少 2 条；两组方差都为零时任务失败且保留可读原因。
 
 以干预组减对照组定义 Δ。Welch t = Δ / sqrt(s1²/n1+s0²/n0)，自由度使用 Welch-Satterthwaite 公式；双侧 p 值和 95% 区间通过 SciPy t 分布计算。Cohen d 使用两组自由度加权 pooled 标准差，描述效应大小，与 Welch 方差假设相互独立。显著性 α 固定为 0.05。观察性分组不能直接做因果断言。
 
-seed 使用 Random(20261115)：160 名学员，4 教学点、各 80 人两组、7 条缺考记录；初始方案为 `2026秋季 · 晚间小组辅导`，初始报告为便于演示的真实计算结果。seed 以 email/code/title 自然键查重，已存在对象不更新，重跑不覆盖用户修改。报告保存计算样本快照与校验码；后续成绩修订不会改旧报告。
+seed 使用 Random(20261115)：160 名学员，4 教学点、各 80 人两组、7 条缺考记录；初始方案为 `2026秋季 · 晚间小组辅导`，初始报告为便于演示的真实计算结果。seed 以 email/code/title 自然键查重，已存在对象不更新，重跑不覆盖用户修改。报告在受理时保存方案快照、计算样本快照（含纳入/排除及原因）与校验码；后续成绩或方案修订不会改旧报告，只有重新提交的新报告反映新口径。
+
+## 队列可靠性与快照口径
+- 受理即固化：创建报告的同一事务写入 `plan_snapshot`、`sample_snapshot`（每条样本带 `included` 与 `exclusion_reason`）和 `snapshot_checksum`；统计服务只读取快照，不再回查可被修订的成绩/方案表。
+- 并发领取：worker 以 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 queued 任务，写入处理者标识与 `run_token`；完成/失败均为条件更新（`status='running' AND run_token=?`），旧处理者晚到的写入影响 0 行。
+- 中断恢复：心跳线程每 8 秒续租；扫描时把心跳超时 30 秒（或领取后从未续租）的 running 任务回收为 queued，`recovery_count` 加一，并重新发 Redis 通知。重试复用原报告行，`attempts` 递增，不新增报告。
+- 重复唤醒：Redis 列表只承担唤醒信号，通知重复或丢失都以数据库扫描为准；同一报告不会因重复通知产生重复结果。
+- 心跳间隔与超时可用 `WORKER_HEARTBEAT_INTERVAL`、`WORKER_HEARTBEAT_TIMEOUT` 覆盖（默认 8 秒/30 秒）；`WORKER_COMPUTE_DELAY` 仅供测试模拟慢计算。
 
 ## 技术与结构
 |层|技术|
@@ -51,19 +60,26 @@ seed 使用 Random(20261115)：160 名学员，4 教学点、各 80 人两组、
 |数据与队列|PostgreSQL 16、Redis 7，独立 Python worker|
 |认证|PyJWT 2.10.1、PBKDF2|
 
-`frontend/src/api` 负责请求，`stores` 管业务状态，`pages` 分四页，`components/common` 复用结果、表格、状态和通知，`hooks` 封装表单/轮询，`utils` 做转义/下载。`backend/src/models` 定义表，`schemas` 验证，`services` 处理业务与算法，`routes` 提供接口，`controllers` 序列化，`middlewares` 处理审计和全局错误。`backend/migrations/001_initial.sql` 是初始结构；启动使用 metadata.create_all，后续字段迁移需人工管理。
+`frontend/src/api` 负责请求，`stores` 管业务状态，`pages` 分四页，`components/common` 复用结果、表格、状态和通知，`hooks` 封装表单/轮询，`utils` 做转义/下载。`backend/src/models` 定义表，`schemas` 验证，`services` 处理业务与算法，`routes` 提供接口，`controllers` 序列化，`middlewares` 处理审计和全局错误。`backend/migrations/001_initial.sql` 是初始结构、`002_report_snapshot_claim.sql` 是快照与领取围栏字段；启动使用 metadata.create_all 并对已有库幂等补齐 002 新增列，后续字段迁移需人工管理。
 
 共享枚举位置：角色 ROLES、分组 GROUPS、报告状态 REPORT_STATUSES 在 `backend/src/constants/enums.py`；前端对应 `frontend/src/constants/enums.js` 的 ROLES、GROUPS、STATUS。API输入的 group 枚举同时在 `backend/src/schemas/business.py` 校验。
 
 ## Docker 与环境变量
 恰好五服务：frontend/backend/worker/db/redis，各有健康检查。backend 和 worker 依赖健康 DB/Redis，frontend 依赖 backend；worker 依赖 backend 初始化完成。数据库、Redis AOF、报告产物预留共享卷分别命名。worker 真正从 Redis 唤醒并处理数据库待执行任务，每 2 秒更新心跳。Redis 任务通知丢失仍会扫描数据库待执行任务。计算结果权威存于数据库，shared reports 卷供未来文件归档；当前 JSON 按快照直接导出。
 
-`.env.example` 列出 COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、POSTGRES_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET（默认 10.253.103.0/24）。所有变量均可覆盖；默认是本地演示配置，外部部署前需更换密码和 JWT_SECRET。`.env` 已忽略。每次最多允许 10 个待执行任务，HTTP 429 提示等待。
+`.env.example` 列出 COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、POSTGRES_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET（默认 10.253.103.0/24）。所有变量均可覆盖；默认是本地演示配置，外部部署前需更换密码和 JWT_SECRET。`.env` 已忽略。每次最多允许 10 个待执行任务，HTTP 429 提示等待。计算结果权威存于数据库，shared reports 卷供未来文件归档；当前 JSON 按快照直接导出。
 
 ## 本地开发
 后端在 Python3.11 虚拟环境运行 `pip install -r backend/requirements.txt`，设置 DATABASE_URL、REDIS_URL、JWT_SECRET，进入 backend 后运行 `uvicorn src.main:app --reload` 和另一个终端 `python -m src.worker`。前端无打包步骤，可直接由 Nginx 提供静态文件并代理 /api/。
 
 ## 已知范围
-不含 CSV 批量导入、随机分组器或多重比较校正；成绩可逐条录入/修订。教学点为自由文本，前端方案选项来自现有成绩。初始报告为同步真实计算的演示快照，新提交报告全部走异步 worker。外网字体不可用时使用本地 serif 回退。进程中断在 running 状态的任务需管理员在数据库重置为 queued；当前小型版本未提供任务取消/自动回收。审计列表只给管理员，最多最近 100 条。
+不含 CSV 批量导入、随机分组器或多重比较校正；成绩可逐条录入/修订。教学点为自由文本，前端方案选项来自现有成绩。初始报告为同步真实计算的演示快照，新提交报告全部走异步 worker。外网字体不可用时使用本地 serif 回退。worker 崩溃或卡死的 running 任务由心跳超时自动回收为 queued 并累计恢复次数，无需人工重置数据库；当前小型版本未提供任务手动取消。审计列表只给管理员，最多最近 100 条。
+
+## 测试
+后端测试位于 `backend/tests/`，需 PostgreSQL 与 Redis（默认连 `localhost:17702/tutor_test` 与 Redis 逻辑库 1/2）：
+```sh
+cd backend && python -m pytest tests/ -q
+```
+`test_acceptance.py` 覆盖受理快照、修订隔离、并发领取、心跳超时回收、旧计算晚到拒写、重复唤醒幂等、失败保留单报告、导出独立复算与签核保留；`test_worker_e2e.py` 以真实 worker 子进程验证正常完成、SIGKILL 崩溃后自动恢复、四 worker 并发与重复唤醒。
 
 License: MIT（见 LICENSE）。真实验收证据在批次根 `test-artifacts/gb-3103/`，源码目录不含截图或测试报告。

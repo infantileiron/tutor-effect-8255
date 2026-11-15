@@ -4,7 +4,7 @@ from sqlalchemy import select,func
 from src.config.database import Base,engine,SessionLocal
 from src.models.entities import User,Student,Plan,Report
 from src.utils.security import hash_password
-from src.services.statistics import welch
+from src.services.statistics import build_snapshot,compute_from_snapshot
 
 def seed():
     Base.metadata.create_all(engine)
@@ -26,7 +26,14 @@ def seed():
             plan=Plan(title=title,campus='全部',exclude_absent=True,description='评估每周两次小组辅导与常规自习的期末成绩差异。缺考学员排除；观察性结果不直接证明因果。');db.add(plan);db.flush()
         db.commit()
         if not db.scalar(select(Report).where(Report.plan_id==plan.id)):
-            result=welch(db.scalars(select(Student).order_by(Student.code)).all(),plan)
-            db.add(Report(plan_id=plan.id,status='completed',result=result,created_at=datetime.now(timezone.utc).isoformat(),conclusion='干预组均分较高。建议保留教学点分层观察，并在下一轮随机分组验证。',published=True));db.commit()
+            all_students=db.scalars(select(Student).order_by(Student.code)).all()
+            plan_snap,sample_snap,checksum=build_snapshot(all_students,plan)
+            result=compute_from_snapshot(plan_snap,sample_snap,checksum)
+            db.add(Report(plan_id=plan.id,status='completed',result=result,
+                          created_at=datetime.now(timezone.utc).isoformat(),
+                          plan_snapshot=plan_snap,sample_snapshot=sample_snap,
+                          snapshot_checksum=checksum,recovery_count=0,attempts=1,
+                          conclusion='干预组均分较高。建议保留教学点分层观察，并在下一轮随机分组验证。',
+                          published=True));db.commit()
         print(json.dumps({table:db.scalar(select(func.count()).select_from(model)) for table,model in [('users',User),('students',Student),('plans',Plan),('reports',Report)]}))
 if __name__=='__main__': seed()

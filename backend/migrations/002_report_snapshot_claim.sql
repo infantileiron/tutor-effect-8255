@@ -1,0 +1,11 @@
+-- 002: 报告受理时点快照 + 多进程领取围栏与中断自动恢复。
+-- 启动时 src.main 会以 information_schema 幂等补齐本文件中的列，可重复执行。
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS plan_snapshot JSON;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS sample_snapshot JSON;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS snapshot_checksum VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS run_token VARCHAR(64);
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS claimed_by VARCHAR(120);
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS recovery_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
